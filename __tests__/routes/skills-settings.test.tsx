@@ -56,19 +56,18 @@ function buildSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
 }
 
 function renderSkillsSettingsScreen() {
-  return render(<SkillsSettingsScreen />, {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const result = render(<SkillsSettingsScreen />, {
     wrapper: ({ children }) => (
-      <QueryClientProvider
-        client={
-          new QueryClient({
-            defaultOptions: { queries: { retry: false } },
-          })
-        }
-      >
+      <QueryClientProvider client={queryClient}>
         <ActiveBackendProvider>{children}</ActiveBackendProvider>
       </QueryClientProvider>
     ),
   });
+
+  return { ...result, queryClient };
 }
 
 describe("SkillsSettingsScreen", () => {
@@ -325,6 +324,50 @@ Full skill body.`,
         expect.objectContaining({ disabled_skills: [skill.name] }),
       ),
     );
+  });
+
+  it("does not overwrite a local toggle when settings refetch with stale data", async () => {
+    const user = userEvent.setup();
+    const previouslyDisabled = buildSkill({ name: "previously-disabled" });
+    const skill = buildSkill({ name: "keep-disabled" });
+    vi.spyOn(SkillsService, "getSkills").mockResolvedValue([
+      previouslyDisabled,
+      skill,
+    ]);
+    const getSettingsSpy = vi
+      .spyOn(SettingsService, "getSettings")
+      .mockResolvedValueOnce(
+        buildSettings({ disabled_skills: [previouslyDisabled.name] }),
+      )
+      .mockResolvedValue(buildSettings({ disabled_skills: [] }));
+    const pendingInitialSave = new Promise<boolean>(() => {});
+    const saveSpy = vi
+      .spyOn(SettingsService, "saveSettings")
+      .mockImplementation((settings) =>
+        settings.disabled_skills?.includes(skill.name)
+          ? Promise.resolve(true)
+          : pendingInitialSave,
+      );
+
+    const { queryClient } = renderSkillsSettingsScreen();
+    const card = await screen.findByTestId(`skill-card-${skill.name}`);
+    const toggle = within(card).getByTestId(`skill-toggle-${skill.name}`);
+
+    await user.click(toggle);
+
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          disabled_skills: [previouslyDisabled.name, skill.name],
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(getSettingsSpy.mock.calls.length).toBeGreaterThanOrEqual(2),
+    );
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+    expect(toggle).toHaveAttribute("aria-checked", "false");
   });
 
   it("toggles a skill from the card without opening the modal", async () => {
