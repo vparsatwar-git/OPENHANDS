@@ -22,6 +22,7 @@ import {
 } from "#/utils/extension-module-card-classes";
 import type { SkillInfo } from "#/types/settings";
 import { getSkillCardDescription } from "#/components/features/skills/get-skill-card-description";
+import { useActiveBackend } from "#/contexts/active-backend-context";
 
 function matchesSearch(skill: SkillInfo, query: string): boolean {
   if (!query) return true;
@@ -45,10 +46,12 @@ function SkillsSettingsScreen() {
   const { mutate: saveSettings } = useSaveSettings();
   const { data: settings, isLoading: settingsLoading } = useSettings();
   const { data: skills, isLoading: skillsLoading } = useSkills();
+  const active = useActiveBackend();
+  const settingsIdentity = JSON.stringify([active.backend.id, active.orgId]);
 
   const [disabledSet, setDisabledSet] = React.useState<Set<string>>(new Set());
-  const [hasHydratedInitialSettings, setHasHydratedInitialSettings] =
-    React.useState(false);
+  const [hydratedSettingsIdentity, setHydratedSettingsIdentity] =
+    React.useState<string | null>(null);
   const [searchQuery, setSearchQuery] = React.useState("");
   const [typeFilter, setTypeFilter] = React.useState<SkillTypeFilter>("all");
   const [selectedSkill, setSelectedSkill] = React.useState<SkillInfo | null>(
@@ -56,12 +59,18 @@ function SkillsSettingsScreen() {
   );
   const [showAddSkillModal, setShowAddSkillModal] = React.useState(false);
 
-  // Sync local state with server settings when data first arrives
+  // Sync local state when settings first arrive or the active backend changes.
   React.useEffect(() => {
-    if (settingsLoading || !settings || hasHydratedInitialSettings) return;
+    if (
+      settingsLoading ||
+      !settings ||
+      hydratedSettingsIdentity === settingsIdentity
+    ) {
+      return;
+    }
     setDisabledSet(new Set(settings.disabled_skills ?? []));
-    setHasHydratedInitialSettings(true);
-  }, [settingsLoading, settings, hasHydratedInitialSettings]);
+    setHydratedSettingsIdentity(settingsIdentity);
+  }, [settingsLoading, settings, settingsIdentity, hydratedSettingsIdentity]);
 
   const handleToggle = (skillName: string, enabled: boolean) => {
     setDisabledSet((prev) => {
@@ -77,7 +86,7 @@ function SkillsSettingsScreen() {
 
   // Auto-save skill toggles once initial settings are loaded.
   React.useEffect(() => {
-    if (!hasHydratedInitialSettings) return;
+    if (hydratedSettingsIdentity !== settingsIdentity) return;
     saveSettings(
       { disabled_skills: Array.from(disabledSet) },
       {
@@ -87,7 +96,13 @@ function SkillsSettingsScreen() {
         },
       },
     );
-  }, [disabledSet, hasHydratedInitialSettings, saveSettings, t]);
+  }, [
+    disabledSet,
+    hydratedSettingsIdentity,
+    settingsIdentity,
+    saveSettings,
+    t,
+  ]);
 
   const isLoading = settingsLoading || skillsLoading || !settings;
 
