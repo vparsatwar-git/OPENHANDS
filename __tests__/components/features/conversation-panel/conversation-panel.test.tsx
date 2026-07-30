@@ -1,4 +1,11 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { I18nextProvider } from "react-i18next";
 import i18n from "i18next";
@@ -18,6 +25,7 @@ import React from "react";
 import { renderWithProviders } from "test-utils";
 import { ConversationPanel } from "#/components/features/conversation-panel/conversation-panel";
 import { useConversationPanelPreferencesStore } from "#/stores/conversation-panel-preferences-store";
+import { useArchivedConversationsStore } from "#/stores/archived-conversations-store";
 import { usePinnedConversationsStore } from "#/stores/pinned-conversations-store";
 import AgentServerConversationService from "#/api/conversation-service/agent-server-conversation-service.api";
 import { AppConversation } from "#/api/conversation-service/agent-server-conversation-service.types";
@@ -112,6 +120,10 @@ describe("ConversationPanel", () => {
     mockStopConversationMutate.mockClear();
     _mockConversationCounter = 0;
     usePinnedConversationsStore.setState({ pinsByBackendId: {} });
+    useArchivedConversationsStore.setState({ archivesByBackendId: {} });
+    useConversationPanelPreferencesStore.setState({
+      showArchivedConversations: false,
+    });
     // Setup default mock for searchConversations
     vi.spyOn(
       AgentServerConversationService,
@@ -151,8 +163,14 @@ describe("ConversationPanel", () => {
     expect(emptyState).toBeInTheDocument();
   });
 
-  it("does not show load more when the visible list is empty even if another page exists", async () => {
-    vi.spyOn(AgentServerConversationService, "searchConversations").mockResolvedValue({
+  it("keeps load more available when the visible list is empty and another page exists", async () => {
+    // Client-side filters (archiving, thread scope) can hide every row of the
+    // loaded pages. Hiding "Load more" there would strand the remaining
+    // backend pages behind an empty list with no way to reach them.
+    vi.spyOn(
+      AgentServerConversationService,
+      "searchConversations",
+    ).mockResolvedValue({
       items: [],
       next_page_id: "page-2",
     });
@@ -160,9 +178,7 @@ describe("ConversationPanel", () => {
     renderConversationPanel();
 
     await screen.findByText("CONVERSATION$NO_CONVERSATIONS");
-    expect(
-      screen.queryByTestId("load-more-conversations"),
-    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("load-more-conversations")).toBeInTheDocument();
   });
 
   it("does not flash the loading skeleton during a background refetch when the list is empty", async () => {
@@ -431,6 +447,74 @@ describe("ConversationPanel", () => {
     // Verify modal is closed after confirmation
     expect(
       screen.queryByRole("button", { name: /confirm/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("should archive a conversation and remove it from the list", async () => {
+    const user = userEvent.setup();
+    renderConversationPanel();
+
+    let cards = await screen.findAllByTestId("conversation-card");
+    expect(cards).toHaveLength(3);
+
+    const firstCardTitle = within(cards[0]).getByText("Conversation 1");
+    expect(firstCardTitle).toBeInTheDocument();
+
+    const ellipsisButton = within(cards[0]).getByTestId("ellipsis-button");
+    await user.click(ellipsisButton);
+    await user.click(screen.getByTestId("archive-button"));
+
+    expect(
+      screen.getByText("CONVERSATION$CONFIRM_ARCHIVE"),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /archive/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByText("CONVERSATION$CONFIRM_ARCHIVE"),
+      ).not.toBeInTheDocument();
+    });
+
+    cards = await screen.findAllByTestId("conversation-card");
+    expect(cards).toHaveLength(2);
+    expect(screen.queryByText("Conversation 1")).not.toBeInTheDocument();
+  });
+
+  it("shows archived conversations when the preference is on and restores them", async () => {
+    // Archiving must stay reversible — that is the whole distinction from
+    // deleting, which removes the conversation from the agent server.
+    const user = userEvent.setup();
+    useArchivedConversationsStore
+      .getState()
+      .archiveConversation("default-local", "1");
+    useConversationPanelPreferencesStore.setState({
+      showArchivedConversations: true,
+    });
+
+    renderConversationPanel();
+
+    const cards = await screen.findAllByTestId("conversation-card");
+    expect(cards).toHaveLength(3);
+    const archivedCard = cards.find((card) =>
+      within(card).queryByText("Conversation 1"),
+    )!;
+    expect(
+      within(archivedCard).getByTestId("conversation-card-archived-chip"),
+    ).toBeInTheDocument();
+
+    await user.click(within(archivedCard).getByTestId("ellipsis-button"));
+    await user.click(screen.getByTestId("unarchive-button"));
+
+    await waitFor(() => {
+      expect(
+        useArchivedConversationsStore
+          .getState()
+          .isArchived("default-local", "1"),
+      ).toBe(false);
+    });
+    expect(
+      screen.queryByTestId("conversation-card-archived-chip"),
     ).not.toBeInTheDocument();
   });
 
@@ -795,9 +879,8 @@ describe("ConversationPanel", () => {
 
     // Test RUNNING conversation - should show stop button
     const runningCard = await getCardByTitle("Running Conversation");
-    const runningEllipsisButton = within(runningCard).getByTestId(
-      "ellipsis-button",
-    );
+    const runningEllipsisButton =
+      within(runningCard).getByTestId("ellipsis-button");
     await user.click(runningEllipsisButton);
 
     expect(await screen.findByTestId("stop-button")).toBeInTheDocument();
@@ -812,9 +895,8 @@ describe("ConversationPanel", () => {
 
     // Test STARTING/RUNNING conversation - should show stop button
     const startingCard = await getCardByTitle("Starting Conversation");
-    const startingEllipsisButton = within(startingCard).getByTestId(
-      "ellipsis-button",
-    );
+    const startingEllipsisButton =
+      within(startingCard).getByTestId("ellipsis-button");
     await user.click(startingEllipsisButton);
 
     expect(await screen.findByTestId("stop-button")).toBeInTheDocument();
@@ -829,9 +911,8 @@ describe("ConversationPanel", () => {
 
     // Test STOPPED conversation - should NOT show stop button
     const stoppedCard = await getCardByTitle("Stopped Conversation");
-    const stoppedEllipsisButton = within(stoppedCard).getByTestId(
-      "ellipsis-button",
-    );
+    const stoppedEllipsisButton =
+      within(stoppedCard).getByTestId("ellipsis-button");
     await user.click(stoppedEllipsisButton);
 
     await waitFor(() => {
@@ -1721,6 +1802,71 @@ describe("ConversationPanel", () => {
         ).not.toBeInTheDocument();
       });
     });
+
+    it("loads hidden workspace folders without adding conversations to an exposed folder", async () => {
+      useConversationPanelPreferencesStore.setState({
+        organizeMode: "grouped",
+      });
+      const noWorkspaceConversations = Array.from({ length: 6 }, (_, index) =>
+        createMockConversation({
+          id: `no-workspace-${index + 1}`,
+          title: `No workspace ${index + 1}`,
+        }),
+      );
+      const searchSpy = vi
+        .spyOn(AgentServerConversationService, "searchConversations")
+        .mockResolvedValueOnce({
+          items: noWorkspaceConversations,
+          next_page_id: "page-2",
+        })
+        .mockResolvedValueOnce({
+          items: [
+            createMockConversation({
+              id: "no-workspace-7",
+              title: "No workspace 7",
+            }),
+            createMockConversation({
+              id: "no-workspace-8",
+              title: "No workspace 8",
+            }),
+          ],
+          next_page_id: "page-3",
+        })
+        .mockResolvedValueOnce({
+          items: [
+            createMockConversation({
+              id: "alpha",
+              title: "Alpha conversation",
+              selected_workspace: "/workspace/alpha",
+            }),
+          ],
+          next_page_id: null,
+        });
+
+      const user = userEvent.setup();
+      renderConversationPanel();
+
+      const noWorkspaceFolder = await screen.findByTestId(
+        "thread-folder-__none_workspace",
+      );
+      expect(
+        within(noWorkspaceFolder).getAllByTestId("conversation-card"),
+      ).toHaveLength(5);
+
+      await user.click(screen.getByTestId("load-more-conversations"));
+
+      await screen.findByTestId("thread-folder-ws--workspace-alpha");
+      expect(searchSpy).toHaveBeenCalledTimes(3);
+
+      await user.click(
+        within(noWorkspaceFolder).getByTestId(
+          "thread-folder-view-more-__none_workspace",
+        ),
+      );
+      expect(
+        within(noWorkspaceFolder).getAllByTestId("conversation-card"),
+      ).toHaveLength(6);
+    });
   });
 
   it("reorders grouped folders via drag and drop", async () => {
@@ -1779,7 +1925,9 @@ describe("ConversationPanel", () => {
     const reorderedAlpha = screen.getByTestId(
       "thread-folder-ws--workspace-alpha",
     );
-    const reorderedBeta = screen.getByTestId("thread-folder-ws--workspace-beta");
+    const reorderedBeta = screen.getByTestId(
+      "thread-folder-ws--workspace-beta",
+    );
     expect(reorderedBeta.compareDocumentPosition(reorderedAlpha)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
@@ -1819,9 +1967,9 @@ describe("ConversationPanel", () => {
     const pinnedSection = await screen.findByTestId(
       "conversation-panel-pinned-section",
     );
-    expect(within(pinnedSection).getAllByTestId("conversation-card")).toHaveLength(
-      1,
-    );
+    expect(
+      within(pinnedSection).getAllByTestId("conversation-card"),
+    ).toHaveLength(1);
     expect(await screen.findAllByTestId("conversation-card")).toHaveLength(3);
     expect(screen.getAllByText("Conversation 2")).toHaveLength(1);
   });
@@ -1837,9 +1985,9 @@ describe("ConversationPanel", () => {
     const pinnedSection = await screen.findByTestId(
       "conversation-panel-pinned-section",
     );
-    expect(within(pinnedSection).getAllByTestId("conversation-card")).toHaveLength(
-      1,
-    );
+    expect(
+      within(pinnedSection).getAllByTestId("conversation-card"),
+    ).toHaveLength(1);
     expect(await screen.findAllByTestId("conversation-card")).toHaveLength(3);
     expect(screen.getAllByText("Conversation 2")).toHaveLength(1);
   });
