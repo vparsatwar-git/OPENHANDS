@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -76,6 +76,17 @@ function FilesTab() {
   const [commitsViewSelected, setCommitsViewSelected] = useState(false);
   let activeView: "on" | "off" | "commits" = diffViewEnabled ? "on" : "off";
   if (commitsViewSelected && showCommitsOption) activeView = "commits";
+
+  // Chat path clicks request the file-content view via contentViewNonce.
+  // Consume each request once so the Diff/Commits toggle isn't pinned.
+  const contentViewNonce = useFilesTabStore((s) => s.contentViewNonce);
+  const consumedContentViewNonce = useRef(contentViewNonce);
+  useEffect(() => {
+    if (contentViewNonce === consumedContentViewNonce.current) return;
+    consumedContentViewNonce.current = contentViewNonce;
+    setFilesTabDiffView(false);
+    setCommitsViewSelected(false);
+  }, [contentViewNonce, setFilesTabDiffView]);
 
   // Collapsed by default — the quick-access pill row at the top is usually
   // enough; the user can expand the tree on demand.
