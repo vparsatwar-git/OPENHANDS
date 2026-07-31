@@ -32,24 +32,28 @@ export const useChatInputLogic = () => {
     conversationId,
     chatInputRef,
   );
+  const previousPanelToggleRef = useRef(hasRightPanelToggled);
 
-  // On the home page (no conversationId) the right-panel / messageToSend
-  // mechanism is not relevant.  More importantly, a stale messageToSend value
-  // in the Zustand store causes useAutoResize to overwrite the just-restored
-  // sessionStorage draft with an empty string (see useAutoResize value effect).
-  // Returning null here keeps value=undefined in useAutoResize so it never
-  // touches the element content on the home page.
-  const messageToSend = conversationId ? rawMessageToSend : null;
+  // A one-shot prefill belongs to exactly one composer. Explicit targeting
+  // avoids timing heuristics and prevents a value queued for home (or another
+  // conversation) from overwriting this composer's restored draft.
+  const messageToSend =
+    rawMessageToSend?.targetConversationId === (conversationId ?? null)
+      ? rawMessageToSend
+      : null;
 
   // Restore a cancelled pending send back into the input only when empty.
   useEffect(() => {
-    if (!conversationId || !messageRestoreIfEmpty) {
+    if (
+      !conversationId ||
+      messageRestoreIfEmpty?.targetConversationId !== conversationId
+    ) {
       return;
     }
 
     const currentText = getTextContent(chatInputRef.current).trim();
     if (currentText.length === 0) {
-      setMessageToSend(messageRestoreIfEmpty.text);
+      setMessageToSend(messageRestoreIfEmpty.text, conversationId);
     }
     clearMessageRestoreIfEmpty();
   }, [
@@ -61,10 +65,16 @@ export const useChatInputLogic = () => {
 
   // Save current input value when drawer state changes (conversation view only)
   useEffect(() => {
-    if (!conversationId) return;
+    const panelToggleChanged =
+      previousPanelToggleRef.current !== hasRightPanelToggled;
+    previousPanelToggleRef.current = hasRightPanelToggled;
+
+    if (!conversationId || !panelToggleChanged) {
+      return;
+    }
     if (chatInputRef.current) {
       const currentText = getTextContent(chatInputRef.current);
-      setMessageToSend(currentText);
+      setMessageToSend(currentText, conversationId);
       setIsRightPanelShown(hasRightPanelToggled);
     }
   }, [
