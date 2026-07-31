@@ -1,8 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CANVAS_UI_CLIENT_TOOL_NAME } from "#/constants/canvas-ui";
 import { DEFAULT_SETTINGS } from "#/services/settings";
 import type { Settings } from "#/types/settings";
-import { buildStartConversationRequest } from "./agent-server-adapter";
+import {
+  buildStartConversationRequest,
+  buildStartPlanningConversationRequest,
+  buildStartPlanningConversationRequestWithEncryptedSettings,
+  toConversationPage,
+} from "./agent-server-adapter";
+import SettingsService from "./settings-service/settings-service.api";
+import AgentProfilesService from "./agent-profiles-service/agent-profiles-service.api";
+import ProfilesService from "./profiles-service/profiles-service.api";
+
+vi.mock("./settings-service/settings-service.api", () => ({
+  default: { getSettingsForConversation: vi.fn() },
+}));
+vi.mock("./secrets-service", () => ({
+  SecretsService: { getSecrets: vi.fn().mockResolvedValue([]) },
+}));
+vi.mock("./agent-profiles-service/agent-profiles-service.api", () => ({
+  default: { listProfiles: vi.fn() },
+}));
+vi.mock("./profiles-service/profiles-service.api", () => ({
+  default: { getProfile: vi.fn() },
+}));
 
 const encryptedValue = "gAAAAAencrypted-mcp-header";
 
@@ -97,6 +118,99 @@ describe("buildStartConversationRequest", () => {
     expect(payload.secrets_encrypted).toBe(true);
   });
 
+  it("builds a raw planning agent request for local Planner", () => {
+    const agentSettings = {
+      agent_kind: "openhands",
+      llm: {
+        model: "openhands/minimax-m2.7",
+        api_key: "gAAAAAencrypted-llm-api-key",
+      },
+    };
+
+    const payload = buildStartPlanningConversationRequest({
+      encryptedAgentSettings: agentSettings,
+      workingDir: "/workspace/project/agent-canvas",
+      parentConversationId: "parent-1",
+      secretsEncrypted: true,
+      customSecrets: [{ name: "CUSTOM_TOKEN" }],
+    });
+
+    expect(payload.agent).toMatchObject({
+      kind: "Agent",
+      system_prompt_filename: "system_prompt_planning.j2",
+      system_prompt_kwargs: {
+        plan_structure: expect.stringContaining("OBJECTIVE"),
+      },
+      llm: {
+        model: "openhands/minimax-m2.7",
+        api_key: "gAAAAAencrypted-llm-api-key",
+      },
+      tools: [
+        { name: "glob", params: {} },
+        { name: "grep", params: {} },
+        {
+          name: "planning_file_editor",
+          params: {
+            plan_path: "/workspace/project/agent-canvas/.agents_tmp/PLAN.md",
+          },
+        },
+      ],
+      // Matches the SDK planning preset's get_planning_condenser.
+      condenser: {
+        kind: "LLMSummarizingCondenser",
+        max_size: 100,
+        keep_first: 6,
+        llm: {
+          model: "openhands/minimax-m2.7",
+          usage_id: "planning_condenser",
+        },
+      },
+    });
+    expect(payload.agent_settings).toBeUndefined();
+    expect(payload.worktree).toBe(false);
+    expect(payload.tags).toEqual({ plannerparent: "parent-1" });
+    expect(payload.secrets_encrypted).toBe(true);
+    expect(payload.secrets).toHaveProperty("CUSTOM_TOKEN");
+  });
+
+  it("links the local planner to its parent server-side so the relationship survives storage loss", () => {
+    const payload = buildStartPlanningConversationRequest({
+      encryptedAgentSettings: {
+        agent_kind: "openhands",
+        llm: { model: "openhands/minimax-m2.7" },
+      },
+      workingDir: "/workspace/project",
+      parentConversationId: "parent-1",
+    });
+
+    // The agent-server derives the parent's `sub_conversation_ids` from this,
+    // which is what makes the planner recoverable without localStorage.
+    expect(payload.parent_conversation_id).toBe("parent-1");
+  });
+
+  it("omits local planner helper conversations from paginated conversation results", () => {
+    const page = toConversationPage({
+      items: [
+        {
+          id: "main-1",
+          created_at: "2024-01-01T00:00:00.000Z",
+          updated_at: "2024-01-01T00:00:00.000Z",
+          execution_status: "idle",
+          tags: {},
+        },
+        {
+          id: "plan-1",
+          created_at: "2024-01-01T00:00:00.000Z",
+          updated_at: "2024-01-01T00:00:00.000Z",
+          execution_status: "idle",
+          tags: { plannerparent: "main-1" },
+        },
+      ],
+    });
+
+    expect(page.items.map((item) => item.id)).toEqual(["main-1"]);
+  });
+
   it("keeps ACP start requests unencrypted when no encrypted MCP values are present", () => {
     const agentSettings = {
       agent_kind: "acp",
@@ -170,6 +284,102 @@ describe("buildStartConversationRequest", () => {
     expect(skillNames).not.toContain("disabled-custom");
     expect(skillNames).toContain("enabled-custom");
     expect(skillNames).toContain("add-javadoc");
+  });
+});
+
+describe("buildStartPlanningConversationRequestWithEncryptedSettings", () => {
+  const globallyActiveSettings = {
+    agentSettings: {
+      agent_kind: "openhands",
+      llm: {
+        model: "openhands/globally-active-model",
+        api_key: "gAAAAAglobal-key",
+        base_url: "https://global.example.com",
+      },
+    },
+    conversationSettings: {},
+    secretsEncrypted: true,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(SettingsService.getSettingsForConversation).mockResolvedValue(
+      globallyActiveSettings,
+    );
+    vi.mocked(AgentProfilesService.listProfiles).mockResolvedValue({
+      profiles: [
+        {
+          id: "profile-parent",
+          name: "parent-profile",
+          agent_kind: "openhands",
+          revision: 1,
+          llm_profile_ref: "parent-llm",
+          mcp_server_refs: null,
+        },
+      ],
+      active_agent_profile_id: "profile-other",
+    });
+    vi.mocked(ProfilesService.getProfile).mockResolvedValue({
+      name: "parent-llm",
+      api_key_set: true,
+      config: {
+        model: "openhands/parent-profile-model",
+        api_key: "gAAAAAparent-key",
+        base_url: "https://parent.example.com",
+      },
+    });
+  });
+
+  it("pins the planner to the parent's launched profile, not the globally active one", async () => {
+    const payload =
+      await buildStartPlanningConversationRequestWithEncryptedSettings({
+        workingDir: "/workspace/project",
+        parentConversationId: "parent-1",
+        parentAgentProfileId: "profile-parent",
+      });
+
+    expect(ProfilesService.getProfile).toHaveBeenCalledWith(
+      "parent-llm",
+      "encrypted",
+    );
+    expect(payload.agent.llm).toMatchObject({
+      model: "openhands/parent-profile-model",
+      api_key: "gAAAAAparent-key",
+      base_url: "https://parent.example.com",
+    });
+  });
+
+  it("falls back to global settings when the parent was not launched from a profile", async () => {
+    const payload =
+      await buildStartPlanningConversationRequestWithEncryptedSettings({
+        workingDir: "/workspace/project",
+        parentConversationId: "parent-1",
+        parentAgentProfileId: null,
+      });
+
+    expect(AgentProfilesService.listProfiles).not.toHaveBeenCalled();
+    expect(payload.agent.llm).toMatchObject({
+      model: "openhands/globally-active-model",
+    });
+  });
+
+  it("falls back to global settings when the parent's profile reference dangles", async () => {
+    vi.mocked(AgentProfilesService.listProfiles).mockResolvedValue({
+      profiles: [],
+      active_agent_profile_id: null,
+    });
+
+    const payload =
+      await buildStartPlanningConversationRequestWithEncryptedSettings({
+        workingDir: "/workspace/project",
+        parentConversationId: "parent-1",
+        parentAgentProfileId: "profile-parent",
+      });
+
+    expect(ProfilesService.getProfile).not.toHaveBeenCalled();
+    expect(payload.agent.llm).toMatchObject({
+      model: "openhands/globally-active-model",
+    });
   });
 });
 

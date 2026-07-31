@@ -32,7 +32,8 @@ export function ConversationTabs({
   isPanelResizing?: boolean;
 }) {
   const { conversationId } = useConversationId();
-  const { setSelectedTab, planContent } = useConversationStore();
+  const { setSelectedTab, planContent, localPlanningConversationId } =
+    useConversationStore();
 
   const [isMenuOpen, setIsMenuOpen] = useState(false);
 
@@ -44,6 +45,12 @@ export function ConversationTabs({
 
   const { handleBuildPlanClick } = useHandleBuildPlanClick();
   const { curAgentState } = useAgentState();
+  // The plan is written by the (local) planner helper conversation, not the
+  // main one — its own run/idle status determines whether the plan is still
+  // being generated, so read it separately from the main agent's.
+  const { curAgentState: curPlanningAgentState } = useAgentState(
+    localPlanningConversationId ?? undefined,
+  );
 
   const {
     selectTab,
@@ -136,19 +143,22 @@ export function ConversationTabs({
 
   // Pinned tabs always show in the bar. Unpinned tabs stay hidden unless the
   // user has that tab selected — then it appears while active so the bar
-  // matches the open panel. Hide Planner on local backends — the planning
-  // agent isn't supported locally.
+  // matches the open panel.
   const visibleTabs = tabs.filter((tab) => {
-    if (tab.tabValue === "planner" && backend.kind !== "cloud") return false;
     if (!persistedState.unpinnedTabs.includes(tab.tabValue)) return true;
     return selectedTab === tab.tabValue;
   });
 
   const unpinnedSignature = persistedState.unpinnedTabs.join(",");
 
+  const isPlanningAgentRunning =
+    !!localPlanningConversationId &&
+    (curPlanningAgentState === AgentState.RUNNING ||
+      curPlanningAgentState === AgentState.LOADING);
   const isAgentRunning =
     curAgentState === AgentState.RUNNING ||
-    curAgentState === AgentState.LOADING;
+    curAgentState === AgentState.LOADING ||
+    isPlanningAgentRunning;
   const isBuildDisabled = isAgentRunning || !planContent;
 
   const tabsRowInnerRef = useRef<HTMLDivElement>(null);
