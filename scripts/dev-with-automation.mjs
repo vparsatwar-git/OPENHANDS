@@ -429,6 +429,10 @@ async function buildConfig(args, env = process.env) {
     autoBackendPort: preferredAutomationPort,
     vitePort: preferredVitePort,
     vscodePort,
+    // Prefix the editor is served under on the ingress origin. Carried on the
+    // config so the route table and the agent-server env are built from one
+    // value (see getLocalServiceRoutes / buildAgentServerEnv).
+    vscodeBasePath: safeConfig.vscodeBasePath,
 
     // Paths
     canvasPath: projectRoot,
@@ -693,6 +697,20 @@ function getLocalServiceRoutes(config) {
     for (const prefix of AGENT_SERVER_ROUTE_PREFIXES) {
       routes.push([prefix, `http://localhost:${config.agentServerPort}`]);
     }
+
+    // The editor is a separate process on its own port, but it is reached
+    // through the same origin as the canvas so no second port has to be
+    // published. The prefix is deliberately preserved rather than stripped:
+    // agent-server launches openvscode-server with `--server-base-path`, so
+    // the editor generates its own HTTP and WebSocket URLs beneath the prefix
+    // and only answers there. `createRouter` matches the longest prefix and
+    // the proxy forwards the original path, so both are already handled.
+    if (config.vscodeBasePath) {
+      routes.push([
+        config.vscodeBasePath,
+        `http://localhost:${config.vscodePort}`,
+      ]);
+    }
   }
 
   return routes;
@@ -700,6 +718,32 @@ function getLocalServiceRoutes(config) {
 
 function buildRouteArgs(routes) {
   return routes.flatMap(([prefix, url]) => ["--route", `${prefix}=${url}`]);
+}
+
+/**
+ * The editor prefix, if this mode serves it, as `--no-referrer-prefix` args.
+ *
+ * agent-server hands the editor a connection token derived from its session
+ * key and advertises it in the URL's query string, so the workbench document
+ * must not leak a Referer to the subresources it loads.
+ */
+function getNoReferrerPrefixArgs(config) {
+  if (!config.launchAgentServer || !config.vscodeBasePath) return [];
+  return ["--no-referrer-prefix", config.vscodeBasePath];
+}
+
+/**
+ * The editor prefix, if this mode serves it, as `--vscode-base-path` args.
+ *
+ * Gated on exactly the same condition as the editor route in
+ * `getLocalServiceRoutes`, because they answer the same question: an origin
+ * advertises the editor if and only if it routes it. static-server enforces
+ * that pairing at startup, so a future edit that breaks it fails loudly rather
+ * than shipping a control that opens the SPA.
+ */
+function getVSCodeAdvertiseArgs(config) {
+  if (!config.launchAgentServer || !config.vscodeBasePath) return [];
+  return ["--vscode-base-path", config.vscodeBasePath];
 }
 
 /**
@@ -715,6 +759,12 @@ function getRejectPrefixes(config) {
   if (!config.launchAgentServer) {
     for (const prefix of AGENT_SERVER_ROUTE_PREFIXES) {
       prefixes.push(prefix);
+    }
+    // No agent-server means no editor behind this prefix either. Reject it
+    // rather than SPA-fallbacking to index.html, which would answer an editor
+    // request with the canvas shell.
+    if (config.vscodeBasePath) {
+      prefixes.push(config.vscodeBasePath);
     }
   }
   return prefixes;
@@ -791,7 +841,12 @@ function startAgentServer(config) {
   });
 
   const agentServerEnv = {
-    ...buildAgentServerEnv(safeConfig),
+    // Opt into prefix-mode: `getLocalServiceRoutes` registers the matching
+    // route on both the static server and the ingress, so the prefix this
+    // advertises resolves to the editor port on the canvas origin.
+    ...buildAgentServerEnv(safeConfig, {
+      vscodeBasePath: config.vscodeBasePath,
+    }),
     ...buildAgentServerAutomationEnv(config),
     OPENHANDS_REMOTE_WS_READY_REQUIRED:
       process.env.OPENHANDS_REMOTE_WS_READY_REQUIRED || "false",
@@ -973,6 +1028,7 @@ function startIngress(config) {
       "--port",
       config.ingressPort.toString(),
       ...buildRouteArgs(getLocalServiceRoutes(config)),
+      ...getNoReferrerPrefixArgs(config),
       ...(frontendBackend ? ["--default", frontendBackend] : []),
     ],
     {
@@ -1021,6 +1077,23 @@ function startVite(config) {
   };
   if (config.viteWorkingDir) {
     viteEnv.VITE_WORKING_DIR = config.viteWorkingDir;
+  }
+
+  // Vite serves the HTML for this mode's browser origin, so this is where the
+  // editor-capability advertisement has to be baked. The ingress in front of it
+  // routes the prefix but is a pure proxy — it injects nothing into the
+  // document, so it cannot tell the frontend what it serves.
+  //
+  // Both variables or neither: `vite.config.ts` only registers the editor proxy
+  // when it has a target as well as a prefix, and this stack has two supported
+  // browser origins — the ingress and Vite's own port, which is why the latter
+  // is in AUTOMATION_CORS_ORIGINS. On the ingress the prefix is routed by the
+  // ingress itself; on the Vite origin only this proxy can serve it. Baking the
+  // prefix alone would advertise an editor on the Vite origin whose URL then
+  // falls through to the SPA — the dead button this gating exists to prevent.
+  if (config.launchAgentServer && config.vscodeBasePath) {
+    viteEnv.VITE_VSCODE_BASE_PATH = config.vscodeBasePath;
+    viteEnv.VITE_VSCODE_TARGET = `http://127.0.0.1:${config.vscodePort}`;
   }
 
   if (runtimeServicesInfo) {
@@ -1477,6 +1550,11 @@ function startStaticFrontend(config, staticDir) {
         : []),
       // Proxy routes only to services that this launch mode started.
       ...buildRouteArgs(getLocalServiceRoutes(config)),
+      // Only the static server injects into the document, so only it can tell
+      // the frontend this origin serves the editor. The ingress routes the same
+      // prefix but proxies the HTML through untouched.
+      ...getVSCodeAdvertiseArgs(config),
+      ...getNoReferrerPrefixArgs(config),
       // Reject known API prefixes that have no backend — returns 503
       // instead of SPA-fallbacking to index.html.
       ...buildRejectPrefixArgs(getRejectPrefixes(config)),
@@ -1499,8 +1577,11 @@ export {
   buildConfig,
   buildRouteArgs,
   buildViteBackendEnv,
+  getNoReferrerPrefixArgs,
+  getVSCodeAdvertiseArgs,
   getFrontendBackend,
   getLocalServiceRoutes,
+  getRejectPrefixes,
   main,
   registerShutdownHook,
   spawnService,
