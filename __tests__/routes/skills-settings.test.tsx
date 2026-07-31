@@ -1,7 +1,14 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within, fireEvent, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import SkillsSettingsScreen from "#/routes/skills-settings";
 import SettingsService from "#/api/settings-service/settings-service.api";
 import SkillsService from "#/api/skills-service";
@@ -12,8 +19,31 @@ import {
 import { MOCK_DEFAULT_USER_SETTINGS } from "#/mocks/handlers";
 import { Settings, SkillInfo } from "#/types/settings";
 import { ActiveBackendProvider } from "#/contexts/active-backend-context";
+import {
+  __resetActiveStoreForTests,
+  getActiveBackend,
+  setActiveSelection,
+  setRegisteredBackends,
+} from "#/api/backend-registry/active-store";
+import type { Backend } from "#/api/backend-registry/types";
 
 const navigateMock = vi.fn();
+
+const backendA: Backend = {
+  id: "backend-a",
+  name: "Backend A",
+  host: "http://backend-a.test",
+  apiKey: "",
+  kind: "local",
+};
+
+const backendB: Backend = {
+  id: "backend-b",
+  name: "Backend B",
+  host: "http://backend-b.test",
+  apiKey: "",
+  kind: "local",
+};
 
 vi.mock("#/context/navigation-context", () => ({
   useNavigation: () => ({
@@ -40,7 +70,8 @@ function buildSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
   return {
     name: "deno",
     type: "knowledge",
-    source: "/Users/test/.openhands/cache/skills/public-skills/skills/deno/SKILL.md",
+    source:
+      "/Users/test/.openhands/cache/skills/public-skills/skills/deno/SKILL.md",
     description:
       "If the project uses deno, use this skill to initialize Deno projects.",
     triggers: ["deno", "deno.json", "deno.lock"],
@@ -56,26 +87,32 @@ function buildSkill(overrides: Partial<SkillInfo> = {}): SkillInfo {
 }
 
 function renderSkillsSettingsScreen() {
-  return render(<SkillsSettingsScreen />, {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const result = render(<SkillsSettingsScreen />, {
     wrapper: ({ children }) => (
-      <QueryClientProvider
-        client={
-          new QueryClient({
-            defaultOptions: { queries: { retry: false } },
-          })
-        }
-      >
+      <QueryClientProvider client={queryClient}>
         <ActiveBackendProvider>{children}</ActiveBackendProvider>
       </QueryClientProvider>
     ),
   });
+
+  return { ...result, queryClient };
 }
 
 describe("SkillsSettingsScreen", () => {
   beforeEach(() => {
+    window.localStorage.clear();
+    __resetActiveStoreForTests();
     vi.restoreAllMocks();
     navigateMock.mockReset();
     vi.spyOn(SettingsService, "getSettings").mockResolvedValue(buildSettings());
+  });
+
+  afterEach(() => {
+    window.localStorage.clear();
+    __resetActiveStoreForTests();
   });
 
   it("renders the description text inside the description badge", async () => {
@@ -118,7 +155,9 @@ Full skill body.`,
 
     expect(
       within(card).getByTestId(`skill-description-${skill.name}`),
-    ).toHaveTextContent("Connect and run commands on remote machines over SSH.");
+    ).toHaveTextContent(
+      "Connect and run commands on remote machines over SSH.",
+    );
   });
 
   it("surfaces the YAML description under the card title with the source path beneath it", async () => {
@@ -247,7 +286,9 @@ Full skill body.`,
       within(modal).getByTestId(`skill-modal-pill-${skill.name}-tool-bash`),
     ).toHaveTextContent("bash");
     expect(
-      within(modal).getByTestId(`skill-modal-pill-${skill.name}-tool-execute_bash`),
+      within(modal).getByTestId(
+        `skill-modal-pill-${skill.name}-tool-execute_bash`,
+      ),
     ).toHaveTextContent("execute_bash");
     expect(
       within(modal).getByTestId(`skill-modal-toggle-${skill.name}`),
@@ -264,7 +305,9 @@ Full skill body.`,
     await user.click(card);
 
     const modal = await screen.findByTestId("skill-detail-modal");
-    expect(within(modal).getByText("SETTINGS$SKILLS_ENABLED")).toBeInTheDocument();
+    expect(
+      within(modal).getByText("SETTINGS$SKILLS_ENABLED"),
+    ).toBeInTheDocument();
 
     await user.click(
       within(modal).getByTestId(`skill-modal-toggle-${skill.name}`),
@@ -274,12 +317,14 @@ Full skill body.`,
     expect(
       within(card).getByTestId(`skill-toggle-${skill.name}`),
     ).toHaveAttribute("aria-checked", "false");
-    expect(within(modal).getByText("SETTINGS$SKILLS_DISABLED")).toBeInTheDocument();
+    expect(
+      within(modal).getByText("SETTINGS$SKILLS_DISABLED"),
+    ).toBeInTheDocument();
   });
 
   it("saves disabled_skills to the server when a skill is toggled off and settings has no prior disabled_skills field", async () => {
     // Reproduces the bug where disabled_skills is absent from settings (undefined),
-    // causing hasHydratedInitialSettings to never become true and the save to be silently skipped.
+    // preventing local hydration from completing and silently skipping the save.
     const user = userEvent.setup();
     const skill = buildSkill({ name: "save-me" });
     vi.spyOn(SkillsService, "getSkills").mockResolvedValue([skill]);
@@ -323,6 +368,116 @@ Full skill body.`,
     await waitFor(() =>
       expect(saveSpy).toHaveBeenCalledWith(
         expect.objectContaining({ disabled_skills: [skill.name] }),
+      ),
+    );
+  });
+
+  it("does not overwrite a local toggle when settings refetch with stale data", async () => {
+    const user = userEvent.setup();
+    const previouslyDisabled = buildSkill({ name: "previously-disabled" });
+    const skill = buildSkill({ name: "keep-disabled" });
+    vi.spyOn(SkillsService, "getSkills").mockResolvedValue([
+      previouslyDisabled,
+      skill,
+    ]);
+    const getSettingsSpy = vi
+      .spyOn(SettingsService, "getSettings")
+      .mockResolvedValueOnce(
+        buildSettings({ disabled_skills: [previouslyDisabled.name] }),
+      )
+      .mockResolvedValue(buildSettings({ disabled_skills: [] }));
+    const pendingInitialSave = new Promise<boolean>(() => {});
+    const saveSpy = vi
+      .spyOn(SettingsService, "saveSettings")
+      .mockImplementation((settings) =>
+        settings.disabled_skills?.includes(skill.name)
+          ? Promise.resolve(true)
+          : pendingInitialSave,
+      );
+
+    const { queryClient } = renderSkillsSettingsScreen();
+    const card = await screen.findByTestId(`skill-card-${skill.name}`);
+    const toggle = within(card).getByTestId(`skill-toggle-${skill.name}`);
+
+    await user.click(toggle);
+
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          disabled_skills: [previouslyDisabled.name, skill.name],
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(getSettingsSpy.mock.calls.length).toBeGreaterThanOrEqual(2),
+    );
+    await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("re-hydrates disabled skills before saving after a backend switch", async () => {
+    const user = userEvent.setup();
+    const disabledOnA = buildSkill({ name: "disabled-on-a" });
+    const disabledOnB = buildSkill({ name: "disabled-on-b" });
+    const toggledOnB = buildSkill({ name: "toggle-on-b" });
+    vi.spyOn(SkillsService, "getSkills").mockResolvedValue([
+      disabledOnA,
+      disabledOnB,
+      toggledOnB,
+    ]);
+    setRegisteredBackends([backendA, backendB]);
+    setActiveSelection({ backendId: backendA.id });
+    const getSettingsSpy = vi
+      .spyOn(SettingsService, "getSettings")
+      .mockImplementation(() =>
+        Promise.resolve(
+          buildSettings({
+            disabled_skills:
+              getActiveBackend().backend.id === backendA.id
+                ? [disabledOnA.name]
+                : [disabledOnB.name],
+          }),
+        ),
+      );
+    const pendingHydrationSave = new Promise<boolean>(() => {});
+    const saveSpy = vi
+      .spyOn(SettingsService, "saveSettings")
+      .mockImplementation((settings) =>
+        settings.disabled_skills?.includes(toggledOnB.name)
+          ? Promise.resolve(true)
+          : pendingHydrationSave,
+      );
+
+    renderSkillsSettingsScreen();
+
+    const toggleA = await screen.findByTestId(
+      `skill-toggle-${disabledOnA.name}`,
+    );
+    const toggleB = screen.getByTestId(`skill-toggle-${disabledOnB.name}`);
+    expect(toggleA).toHaveAttribute("aria-checked", "false");
+    expect(toggleB).toHaveAttribute("aria-checked", "true");
+
+    act(() => setActiveSelection({ backendId: backendB.id }));
+
+    await waitFor(() => expect(getSettingsSpy).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      expect(
+        screen.getByTestId(`skill-toggle-${disabledOnA.name}`),
+      ).toHaveAttribute("aria-checked", "true");
+      expect(
+        screen.getByTestId(`skill-toggle-${disabledOnB.name}`),
+      ).toHaveAttribute("aria-checked", "false");
+    });
+    saveSpy.mockClear();
+
+    await user.click(screen.getByTestId(`skill-toggle-${toggledOnB.name}`));
+
+    await waitFor(() =>
+      expect(saveSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          disabled_skills: [disabledOnB.name, toggledOnB.name],
+        }),
       ),
     );
   });
