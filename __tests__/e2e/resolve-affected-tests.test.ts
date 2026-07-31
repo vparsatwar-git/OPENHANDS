@@ -1,6 +1,5 @@
 // @vitest-environment node
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -14,10 +13,9 @@ const resolverPath = path.join(
   repoRoot,
   "tests/e2e/mock-llm/scripts/resolve-affected-tests.mjs",
 );
-const workflowPath = path.join(repoRoot, ".github/workflows/mock-llm-e2e.yml");
-const dockerWorkflowPath = path.join(
+const workflowPolicyPath = path.join(
   repoRoot,
-  ".github/workflows/mock-llm-docker-e2e.yml",
+  "tests/e2e/mock-llm/scripts/evaluate-workflow-policy.mjs",
 );
 
 function resolveAffectedTests(files: string[]) {
@@ -28,6 +26,25 @@ function resolveAffectedTests(files: string[]) {
   ).trim();
 
   return output.length > 0 ? output.split(/\s+/) : [];
+}
+
+function evaluateWorkflowPolicy() {
+  const output = execFileSync(
+    process.execPath,
+    [workflowPolicyPath, "--json"],
+    {
+      cwd: repoRoot,
+      encoding: "utf-8",
+    },
+  );
+
+  return JSON.parse(output) as Array<{
+    workflow: string;
+    scenario: string;
+    workflowTriggered: boolean;
+    jobRuns: boolean;
+    matchesExpected: boolean;
+  }>;
 }
 
 describe("mock-LLM E2E affected test resolver", () => {
@@ -79,25 +96,45 @@ describe("mock-LLM E2E affected test resolver", () => {
     expect(resolveAffectedTests([file])).toEqual(["__ALL__"]);
   });
 
-  it("keeps resolver failures from becoming selective test paths", () => {
-    const workflow = readFileSync(workflowPath, "utf-8");
-
-    expect(workflow).toContain("if ! RESULT=$(node");
-    expect(workflow).toContain("Affected-test resolver failed");
-    expect(workflow).not.toContain("2>&1) || true");
-  });
-
-  it("keeps E2E workflows from path-skipping required PR checks", () => {
-    const workflow = readFileSync(workflowPath, "utf-8");
-    const dockerWorkflow = readFileSync(dockerWorkflowPath, "utf-8");
-
-    expect(workflow).not.toContain("\n    paths:\n");
-    expect(workflow).toContain("detect-pr-changes:");
-    expect(workflow).toContain("needs.detect-pr-changes.outputs.should_run");
-    expect(dockerWorkflow).not.toContain("\n    paths:\n");
-    expect(dockerWorkflow).toContain("detect-pr-changes:");
-    expect(dockerWorkflow).toContain(
-      "needs.detect-pr-changes.outputs.should_run",
+  it("runs full E2E only for the intended workflow event matrix", () => {
+    const rows = evaluateWorkflowPolicy();
+    const byScenario = new Map(
+      rows.map((row) => [`${row.workflow}:${row.scenario}`, row]),
     );
+
+    expect(rows.every((row) => row.matchesExpected)).toBe(true);
+    expect(byScenario.get("mock-llm-e2e:main push")).toMatchObject({
+      workflowTriggered: true,
+      jobRuns: true,
+    });
+    expect(
+      byScenario.get("mock-llm-e2e:ordinary same-repository PR"),
+    ).toMatchObject({
+      workflowTriggered: true,
+      jobRuns: false,
+    });
+    expect(byScenario.get("mock-llm-e2e:non-main push")).toMatchObject({
+      workflowTriggered: false,
+      jobRuns: false,
+    });
+    expect(
+      byScenario.get("mock-llm-e2e:same-repository release-please PR"),
+    ).toMatchObject({ workflowTriggered: true, jobRuns: true });
+    expect(
+      byScenario.get(
+        "mock-llm-docker-e2e:successful Docker workflow_run on main",
+      ),
+    ).toMatchObject({ workflowTriggered: true, jobRuns: true });
+    expect(
+      byScenario.get(
+        "mock-llm-docker-e2e:successful Docker workflow_run on non-main",
+      ),
+    ).toMatchObject({ workflowTriggered: false, jobRuns: false });
+    expect(
+      byScenario.get("mock-llm-docker-e2e:ordinary same-repository PR"),
+    ).toMatchObject({ workflowTriggered: true, jobRuns: false });
+    expect(
+      byScenario.get("mock-llm-docker-e2e:same-repository release-please PR"),
+    ).toMatchObject({ workflowTriggered: true, jobRuns: true });
   });
 });
